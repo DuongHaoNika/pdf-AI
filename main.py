@@ -6,9 +6,11 @@ from langchain_community.llms import Ollama
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain.prompts import PromptTemplate
 import os
 from datetime import datetime
 import torch
+import re
 
 # Set page config
 st.set_page_config(page_title="PDF Question Answering System", page_icon="📚", layout="wide")
@@ -55,8 +57,60 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize embeddings
-embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+# Initialize embeddings with multilingual model
+embeddings = SentenceTransformerEmbeddings(model_name="paraphrase-multilingual-MiniLM-L12-v2")
+
+# Text processing function for Vietnamese
+def process_vietnamese_text(text):
+    # Remove extra whitespace and normalize spaces
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Remove special characters but keep Vietnamese diacritics and common punctuation
+    text = re.sub(r'[^\w\s\u00C0-\u1EF9.,;:!?()\-]', ' ', text)
+    
+    # Fix spacing around punctuation
+    text = re.sub(r'\s*([.,;:!?])\s*', r'\1 ', text)
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Fix spacing around parentheses
+    text = re.sub(r'\(\s+', '(', text)
+    text = re.sub(r'\s+\)', ')', text)
+    
+    # Remove spaces before punctuation
+    text = re.sub(r'\s+([.,;:!?])', r'\1', text)
+    
+    # Remove multiple spaces
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Remove leading/trailing spaces
+    text = text.strip()
+    
+    return text
+
+# Custom prompt template with RAG
+template = """Bạn là một trợ lý AI thông minh, được thiết kế để trả lời câu hỏi dựa trên nội dung của tài liệu PDF. 
+Hãy tuân thủ các nguyên tắc sau:
+1. Chỉ trả lời dựa trên thông tin có trong các đoạn văn bản được cung cấp
+2. Nếu không tìm thấy thông tin trong các đoạn văn bản, hãy nói rõ rằng bạn không có thông tin
+3. Trả lời bằng tiếng Việt nếu câu hỏi bằng tiếng Việt
+4. Trả lời ngắn gọn, súc tích và dễ hiểu
+5. Nếu câu hỏi không liên quan đến nội dung PDF, hãy nhắc người dùng tập trung vào nội dung PDF
+
+Các đoạn văn bản liên quan từ tài liệu:
+{context}
+
+Lịch sử hội thoại:
+{chat_history}
+
+Câu hỏi: {question}
+
+Hãy trả lời dựa trên các đoạn văn bản trên. Nếu thông tin không đủ, hãy nói rõ.
+Trả lời: """
+
+PROMPT = PromptTemplate(
+    template=template,
+    input_variables=["context", "chat_history", "question"]
+)
 
 # Initialize session state
 if "conversation" not in st.session_state:
@@ -123,6 +177,10 @@ with st.sidebar:
         loader = PyPDFLoader(pdf_path)
         pages = loader.load()
         
+        # Process text for Vietnamese content
+        for page in pages:
+            page.page_content = process_vietnamese_text(page.page_content)
+        
         # Split text into chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -131,20 +189,23 @@ with st.sidebar:
         )
         chunks = text_splitter.split_documents(pages)
         
-        # Create vector store using SentenceTransformer embeddings
-        vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory=f"chroma_db/{uploaded_file.name}"
-        )
-        
-        # Store in session state
-        st.session_state.pdfs[uploaded_file.name] = {
-            "path": pdf_path,
-            "vectorstore": vectorstore
-        }
-        st.session_state.current_pdf = uploaded_file.name
-        st.success(f"PDF '{uploaded_file.name}' processed successfully!")
+        try:
+            # Create vector store using multilingual embeddings
+            vectorstore = Chroma.from_documents(
+                documents=chunks,
+                embedding=embeddings,
+                persist_directory=f"chroma_db/{uploaded_file.name}"
+            )
+            
+            # Store in session state
+            st.session_state.pdfs[uploaded_file.name] = {
+                "path": pdf_path,
+                "vectorstore": vectorstore
+            }
+            st.session_state.current_pdf = uploaded_file.name
+            st.success(f"PDF '{uploaded_file.name}' processed successfully!")
+        except Exception as e:
+            st.error(f"Error processing PDF: {str(e)}")
     
     # Display list of processed PDFs
     st.markdown("### Your PDFs")
@@ -165,20 +226,30 @@ if st.session_state.current_pdf:
         st.error("Selected PDF not found. Please upload it again.")
     else:
         if "conversation" not in st.session_state or st.session_state.conversation is None:
-            # Initialize Ollama LLM
-            llm = Ollama(model="llama3.2")
-            
-            # Create conversation chain
-            memory = ConversationBufferMemory(
-                memory_key="chat_history",
-                return_messages=True
-            )
-            
-            st.session_state.conversation = ConversationalRetrievalChain.from_llm(
-                llm=llm,
-                retriever=st.session_state.pdfs[st.session_state.current_pdf]["vectorstore"].as_retriever(),
-                memory=memory
-            )
+            try:
+                # Initialize Ollama LLM
+                llm = Ollama(model="llama3.2")
+                
+                # Create conversation chain
+                memory = ConversationBufferMemory(
+                    memory_key="chat_history",
+                    return_messages=True
+                )
+                
+                # Create retriever with top 3 most relevant chunks
+                retriever = st.session_state.pdfs[st.session_state.current_pdf]["vectorstore"].as_retriever(
+                    search_kwargs={"k": 3}  # Get top 3 most relevant chunks
+                )
+                
+                st.session_state.conversation = ConversationalRetrievalChain.from_llm(
+                    llm=llm,
+                    retriever=retriever,
+                    memory=memory,
+                    combine_docs_chain_kwargs={"prompt": PROMPT}
+                )
+            except Exception as e:
+                st.error(f"Error initializing conversation: {str(e)}")
+                st.stop()
         
         # Display chat history
         for message in st.session_state.chat_history:
@@ -207,6 +278,9 @@ if st.session_state.current_pdf:
             submit_button = st.form_submit_button("Send")
             
             if submit_button and user_question:
+                # Process Vietnamese question
+                processed_question = process_vietnamese_text(user_question)
+                
                 # Add user message to chat history
                 st.session_state.chat_history.append({
                     "role": "user",
@@ -215,15 +289,31 @@ if st.session_state.current_pdf:
                 })
                 
                 with st.spinner("Thinking..."):
-                    # Use invoke instead of __call__
-                    response = st.session_state.conversation.invoke({"question": user_question})
-                    
-                    # Add bot response to chat history
-                    st.session_state.chat_history.append({
-                        "role": "bot",
-                        "content": response["answer"],
-                        "timestamp": datetime.now().strftime("%H:%M")
-                    })
+                    try:
+                        # Get relevant chunks before getting the response
+                        retriever = st.session_state.pdfs[st.session_state.current_pdf]["vectorstore"].as_retriever(
+                            search_kwargs={"k": 3}
+                        )
+                        relevant_docs = retriever.get_relevant_documents(processed_question)
+                        
+                        # Print relevant chunks to terminal
+                        print("\n=== Các đoạn văn bản liên quan ===")
+                        for i, doc in enumerate(relevant_docs, 1):
+                            print(f"\nĐoạn {i}:")
+                            print(doc.page_content)
+                            print("-" * 80)
+                        
+                        # Use invoke instead of __call__
+                        response = st.session_state.conversation.invoke({"question": processed_question})
+                        
+                        # Add bot response to chat history
+                        st.session_state.chat_history.append({
+                            "role": "bot",
+                            "content": response["answer"],
+                            "timestamp": datetime.now().strftime("%H:%M")
+                        })
+                    except Exception as e:
+                        st.error(f"Error processing question: {str(e)}")
                 
                 st.rerun()
 else:
